@@ -1,0 +1,110 @@
+name: UR House Watcher
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "check_ur.py"
+      - "config.yml"
+      - "requirements.txt"
+      - ".github/workflows/ur-house-watcher.yml"
+  schedule:
+    # GitHub cron is UTC. Run every 10 minutes from 07:00 through 23:50 JST.
+    # JST 07:00-23:50 = UTC 22:00-14:50 (crosses midnight UTC).
+    - cron: "*/10 22-23 * * *"
+    - cron: "*/10 0-14 * * *"
+  workflow_dispatch:
+    inputs:
+      send_test_notification:
+        description: "Send a Telegram test notification only"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: ur-house-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send Telegram test notification
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.send_test_notification == true }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        shell: bash
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets are missing."
+            exit 1
+          fi
+
+          TEXT=$'✅ UR House Watcher 测试成功\n\nTelegram Bot 配置正常。\n当前监控：大島四丁目 / 大島六丁目\n条件：2LDK / 3DK，50㎡以上\n\n下面按钮用于确认真实通知中的点击跳转样式。'
+          REPLY_MARKUP='{"inline_keyboard":[[{"text":"🏠 立即查看・仮申込（测试）","url":"https://www.ur-net.go.jp/chintai/kanto/tokyo/20_1920_room.html"}]]}'
+
+          response=$(curl --silent --show-error --fail-with-body \
+            --request POST \
+            --url "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "reply_markup=${REPLY_MARKUP}")
+
+          echo "$response" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("ok") is True, d; print("Telegram test notification with clickable UR button sent successfully.")'
+
+      - name: Check UR vacancies
+        id: check
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.send_test_notification == true) }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        shell: bash
+        run: |
+          set +e
+          python check_ur.py
+          code=$?
+          if [ "$code" -eq 10 ]; then
+            echo "new_rooms=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$code"
+
+      - name: Create GitHub Issue when new rooms appear
+        if: steps.check.outputs.new_rooms == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "🏠 UR 新空房 $(date -u +'%Y-%m-%d')" \
+            --body-file notification.md
+
+      - name: Persist watcher state
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.send_test_notification == true) }}
+        run: |
+          if git diff --quiet -- state.json; then
+            echo "No state change"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "chore: update UR vacancy state"
+          git push
