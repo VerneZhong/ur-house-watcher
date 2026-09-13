@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin
@@ -17,6 +18,7 @@ HEALTH_FILE = ROOT / "health_state.json"
 CONFIG_FILE = ROOT / "config.yml"
 OUTPUT_FILE = ROOT / "notification.md"
 TIMEOUT = 20
+RETRY_DELAYS = (2, 5)
 FAILURE_REMINDER_INTERVAL = timedelta(hours=1)
 JST = ZoneInfo("Asia/Tokyo")
 UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
@@ -74,30 +76,50 @@ def parse_area(value):
 def post_room_api(session, target, page_index):
     shisya, danchi, shikibetu = parse_property_code(target["url"])
     room_page = target.get("room_url") or target["url"].replace(".html", "_room.html")
-    response = session.post(
-        UR_API,
-        data={
-            "shisya": shisya,
-            "danchi": danchi,
-            "shikibetu": shikibetu,
-            "orderByField": "0",
-            "orderBySort": "0",
-            "pageIndex": str(page_index),
-        },
-        timeout=TIMEOUT,
-        headers={
-            "User-Agent": UA,
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "ja-JP,ja;q=0.9",
-            "Referer": room_page,
-            "X-Requested-With": "XMLHttpRequest",
-        },
-    )
-    response.raise_for_status()
-    data = response.json()
-    if data is not None and not isinstance(data, list):
-        raise ValueError(f"Unexpected UR API response type: {type(data).__name__}")
-    return data
+    attempts = len(RETRY_DELAYS) + 1
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.post(
+                UR_API,
+                data={
+                    "shisya": shisya,
+                    "danchi": danchi,
+                    "shikibetu": shikibetu,
+                    "orderByField": "0",
+                    "orderBySort": "0",
+                    "pageIndex": str(page_index),
+                },
+                timeout=TIMEOUT,
+                headers={
+                    "User-Agent": UA,
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Accept-Language": "ja-JP,ja;q=0.9",
+                    "Referer": room_page,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data is not None and not isinstance(data, list):
+                raise ValueError(
+                    f"Unexpected UR API response type: {type(data).__name__}"
+                )
+            return data
+        except (requests.RequestException, ValueError) as exc:
+            if attempt >= attempts:
+                raise
+
+            delay = RETRY_DELAYS[attempt - 1]
+            print(
+                f"{target['name']}: UR API request failed "
+                f"(page {page_index}, attempt {attempt}/{attempts}): {exc}; "
+                f"retrying in {delay}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("UR API retry loop exited unexpectedly")
 
 
 def fetch_vacant_rooms(session, target, layouts, min_area):
