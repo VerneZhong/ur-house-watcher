@@ -3,20 +3,28 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import requests
 import yaml
 
 ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / "state.json"
+HEALTH_FILE = ROOT / "health_state.json"
 CONFIG_FILE = ROOT / "config.yml"
 OUTPUT_FILE = ROOT / "notification.md"
 TIMEOUT = 20
+FAILURE_REMINDER_INTERVAL = timedelta(hours=1)
+JST = ZoneInfo("Asia/Tokyo")
 UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
 UR_API = "https://chintai.r6.ur-net.go.jp/chintai/api/bukken/detail/detail_bukken_room/"
+
+
+def now_jst():
+    return datetime.now(JST)
 
 
 def load_json(path, default):
@@ -24,6 +32,22 @@ def load_json(path, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return default
+
+
+def write_json(path, data):
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def parse_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def room_key(room):
@@ -144,11 +168,32 @@ def telegram_credentials():
     )
 
 
-def telegram_send_room(room):
+def telegram_send_message(message, reply_markup=None):
     token, chat_id = telegram_credentials()
     if not token or not chat_id:
-        return False
+        raise RuntimeError("Telegram credentials are missing")
 
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    response = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json=payload,
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API rejected message: {data}")
+    return True
+
+
+def telegram_send_room(room):
     fee = f"（共益費 {room['commonfee']}）" if room.get("commonfee") else ""
     room_name = f" {room['room']}" if room.get("room") else ""
     floor = f" / {room['floor']}" if room.get("floor") else ""
@@ -163,30 +208,18 @@ def telegram_send_room(room):
             "先着順です。条件を確認して、対応可能ならすぐ仮申込してください。",
         ]
     )
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "disable_web_page_preview": True,
-        "reply_markup": {
+    return telegram_send_message(
+        message,
+        {
             "inline_keyboard": [
                 [{"text": "🏠 立即查看・仮申込", "url": room["href"]}]
             ]
         },
-    }
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json=payload,
-        timeout=TIMEOUT,
     )
-    response.raise_for_status()
-    data = response.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram API rejected message: {data}")
-    return True
 
 
 def format_notice(new_rooms):
-    now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    now = now_jst().strftime("%Y-%m-%d %H:%M JST")
     lines = ["# 🏠 UR 新空房提醒", "", f"检查时间：{now}", ""]
     for room in new_rooms:
         fee = f"（共益費 {room['commonfee']}）" if room.get("commonfee") else ""
@@ -201,6 +234,109 @@ def format_notice(new_rooms):
         ]
     lines += ["> UR 房源先着顺。收到提醒后建议立即打开官网确认。"]
     return "\n".join(lines)
+
+
+def format_failure_message(errors, consecutive_failures, first_failure_at):
+    now = now_jst().strftime("%Y-%m-%d %H:%M JST")
+    lines = [
+        "⚠️ UR House Watcher 执行失败",
+        "",
+        f"时间：{now}",
+        f"连续失败：{consecutive_failures} 次",
+    ]
+    if first_failure_at:
+        lines.append(f"首次失败：{first_failure_at.astimezone(JST).strftime('%Y-%m-%d %H:%M JST')}")
+    lines += ["", "失败详情："]
+    lines.extend(f"• {error}" for error in errors)
+    lines += [
+        "",
+        "已保留上一次房源状态。",
+        "系统将在下一个 5 分钟周期自动重试。",
+    ]
+    return "\n".join(lines)
+
+
+def format_recovery_message(health):
+    now = now_jst()
+    first_failure_at = parse_datetime(health.get("first_failure_at"))
+    lines = [
+        "✅ UR House Watcher 已恢复",
+        "",
+        f"恢复时间：{now.strftime('%Y-%m-%d %H:%M JST')}",
+        "大島四丁目：正常",
+        "大島六丁目：正常",
+    ]
+    if first_failure_at:
+        duration = now - first_failure_at.astimezone(JST)
+        minutes = max(0, int(duration.total_seconds() // 60))
+        lines.append(f"故障持续时间：约 {minutes} 分钟")
+    return "\n".join(lines)
+
+
+def handle_failure(errors):
+    now = now_jst()
+    health = load_json(HEALTH_FILE, {})
+    was_failed = health.get("status") == "failed"
+    first_failure_at = parse_datetime(health.get("first_failure_at")) if was_failed else now
+    consecutive_failures = int(health.get("consecutive_failures", 0)) + 1 if was_failed else 1
+    last_alert_at = parse_datetime(health.get("last_alert_at"))
+
+    should_alert = not was_failed
+    if was_failed and (last_alert_at is None or now - last_alert_at.astimezone(JST) >= FAILURE_REMINDER_INTERVAL):
+        should_alert = True
+
+    health.update(
+        {
+            "status": "failed",
+            "first_failure_at": first_failure_at.astimezone(JST).isoformat(),
+            "last_failure_at": now.isoformat(),
+            "consecutive_failures": consecutive_failures,
+            "last_errors": errors,
+        }
+    )
+
+    if should_alert:
+        try:
+            telegram_send_message(
+                format_failure_message(errors, consecutive_failures, first_failure_at)
+            )
+            health["last_alert_at"] = now.isoformat()
+            print("Failure notification sent to Telegram.", file=sys.stderr)
+        except Exception as exc:
+            print(f"Failure notification could not be sent: {exc}", file=sys.stderr)
+
+    write_json(HEALTH_FILE, health)
+
+
+def handle_recovery_if_needed():
+    health = load_json(HEALTH_FILE, {})
+    if health.get("status") != "failed":
+        write_json(
+            HEALTH_FILE,
+            {
+                "status": "ok",
+                "last_success_at": now_jst().isoformat(),
+                "consecutive_failures": 0,
+            },
+        )
+        return
+
+    try:
+        telegram_send_message(format_recovery_message(health))
+        print("Recovery notification sent to Telegram.")
+        write_json(
+            HEALTH_FILE,
+            {
+                "status": "ok",
+                "last_success_at": now_jst().isoformat(),
+                "consecutive_failures": 0,
+            },
+        )
+    except Exception as exc:
+        print(f"Recovery notification could not be sent: {exc}", file=sys.stderr)
+        health["last_success_at"] = now_jst().isoformat()
+        health["recovery_notification_pending"] = True
+        write_json(HEALTH_FILE, health)
 
 
 def main():
@@ -222,27 +358,25 @@ def main():
     if errors:
         print("UR vacancy check failed; preserving previous state.", file=sys.stderr)
         print("\n".join(errors), file=sys.stderr)
+        handle_failure(errors)
         return 1
+
+    handle_recovery_if_needed()
 
     unique = {room_key(room): room for room in current_rooms}
     current_keys = set(unique)
     new_rooms = [unique[key] for key in sorted(current_keys - previous)]
     notify_rooms = new_rooms if bool(state.get("initialized")) else []
 
-    STATE_FILE.write_text(
-        json.dumps(
-            {
-                "initialized": True,
-                "checked_at": datetime.now().astimezone().isoformat(),
-                "room_keys": sorted(current_keys),
-                "rooms": list(unique.values()),
-                "errors": [],
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+    write_json(
+        STATE_FILE,
+        {
+            "initialized": True,
+            "checked_at": now_jst().isoformat(),
+            "room_keys": sorted(current_keys),
+            "rooms": list(unique.values()),
+            "errors": [],
+        },
     )
 
     if notify_rooms:
